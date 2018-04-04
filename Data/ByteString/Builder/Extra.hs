@@ -122,9 +122,9 @@ runBuilder = run . I.runBuilder
   where
     bytesWritten startPtr endPtr = endPtr `minusPtr` startPtr
 
-    run :: I.BuildStep () -> BufferWriter
+    run :: I.BuildStep -> BufferWriter
     run step = \buf len ->
-      let doneH endPtr () =
+      let doneH endPtr =
             let !wc  = bytesWritten buf endPtr
                 next = Done
              in return (wc, next)

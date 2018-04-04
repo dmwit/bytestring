@@ -60,11 +60,6 @@ module Data.ByteString.Builder.Internal (
   , bufferSize
   , byteStringFromBuffer
 
-  , ChunkIOStream(..)
-  , buildStepToCIOS
-  , ciosUnitToLazyByteString
-  , ciosToLazyByteString
-
   -- * Build signals and steps
   , BuildSignal
   , BuildStep
@@ -119,8 +114,6 @@ module Data.ByteString.Builder.Internal (
   , runPut
 
   -- ** Execution
-  , putToLazyByteString
-  , putToLazyByteStringWith
   , hPut
 
   -- ** Conversion to and from Builders
@@ -227,42 +220,28 @@ trimmedChunkFromBuffer (AllocationStrategy _ _ trim) buf k
 -- execution of a 'BuildStep' by 'buildStepToCIOS'. Typical users of this
 -- interface are 'ciosToLazyByteString' or iteratee-style libraries like
 -- @enumerator@.
-data ChunkIOStream a =
-       Finished Buffer a
+data ChunkIOStream =
+       Finished Buffer
        -- ^ The partially filled last buffer together with the result.
-     | Yield1 S.ByteString (IO (ChunkIOStream a))
+     | Yield1 S.ByteString (IO ChunkIOStream)
        -- ^ Yield a /non-empty/ strict 'S.ByteString'.
 
 -- | A smart constructor for yielding one chunk that ignores the chunk if
 -- it is empty.
 {-# INLINE yield1 #-}
-yield1 :: S.ByteString -> IO (ChunkIOStream a) -> IO (ChunkIOStream a)
+yield1 :: S.ByteString -> IO ChunkIOStream -> IO ChunkIOStream
 yield1 bs cios | S.null bs = cios
                | otherwise = return $ Yield1 bs cios
 
--- | Convert a @'ChunkIOStream' ()@ to a lazy 'L.ByteString' using
+-- | Convert a 'ChunkIOStream' to a lazy 'L.ByteString' using
 -- 'unsafeDupablePerformIO'.
 {-# INLINE ciosUnitToLazyByteString #-}
 ciosUnitToLazyByteString :: AllocationStrategy
-                         -> L.ByteString -> ChunkIOStream () -> L.ByteString
+                         -> L.ByteString -> ChunkIOStream -> L.ByteString
 ciosUnitToLazyByteString strategy k = go
   where
-    go (Finished buf _) = trimmedChunkFromBuffer strategy buf k
+    go (Finished buf)   = trimmedChunkFromBuffer strategy buf k
     go (Yield1 bs io)   = L.Chunk bs $ unsafeDupablePerformIO (go <$> io)
-
--- | Convert a 'ChunkIOStream' to a lazy tuple of the result and the written
--- 'L.ByteString' using 'unsafeDupablePerformIO'.
-{-# INLINE ciosToLazyByteString #-}
-ciosToLazyByteString :: AllocationStrategy
-                     -> (a -> (b, L.ByteString))
-                     -> ChunkIOStream a
-                     -> (b, L.ByteString)
-ciosToLazyByteString strategy k =
-    go
-  where
-    go (Finished buf x) =
-        second (trimmedChunkFromBuffer strategy buf) $ k x
-    go (Yield1 bs io)   = second (L.Chunk bs) $ unsafeDupablePerformIO (go <$> io)
 
 ------------------------------------------------------------------------------
 -- Build signals
@@ -270,26 +249,25 @@ ciosToLazyByteString strategy k =
 
 -- | 'BuildStep's may be called *multiple times* and they must not rise an
 -- async. exception.
-type BuildStep a = BufferRange -> IO (BuildSignal a)
+type BuildStep = BufferRange -> IO BuildSignal
 
 -- | 'BuildSignal's abstract signals to the caller of a 'BuildStep'. There are
 -- three signals: 'done', 'bufferFull', or 'insertChunks signals
-data BuildSignal a =
-    Done {-# UNPACK #-} !(Ptr Word8) a
+data BuildSignal =
+    Done {-# UNPACK #-} !(Ptr Word8)
   | BufferFull
       {-# UNPACK #-} !Int
       {-# UNPACK #-} !(Ptr Word8)
-                     (BuildStep a)
+                     BuildStep
   | InsertChunk
       {-# UNPACK #-} !(Ptr Word8)
                      S.ByteString
-                     (BuildStep a)
+                     BuildStep
 
 -- | Signal that the current 'BuildStep' is done and has computed a value.
 {-# INLINE done #-}
 done :: Ptr Word8      -- ^ Next free byte in current 'BufferRange'
-     -> a              -- ^ Computed value
-     -> BuildSignal a
+     -> BuildSignal
 done = Done
 
 -- | Signal that the current buffer is full.
@@ -298,12 +276,12 @@ bufferFull :: Int
            -- ^ Minimal size of next 'BufferRange'.
            -> Ptr Word8
            -- ^ Next free byte in current 'BufferRange'.
-           -> BuildStep a
+           -> BuildStep
            -- ^ 'BuildStep' to run on the next 'BufferRange'. This 'BuildStep'
            -- may assume that it is called with a 'BufferRange' of at least the
            -- required minimal size; i.e., the caller of this 'BuildStep' must
            -- guarantee this.
-           -> BuildSignal a
+           -> BuildSignal
 bufferFull = BufferFull
 
 
@@ -313,22 +291,22 @@ insertChunk :: Ptr Word8
             -- ^ Next free byte in current 'BufferRange'
             -> S.ByteString
             -- ^ Chunk to insert.
-            -> BuildStep a
+            -> BuildStep
             -- ^ 'BuildStep' to run on next 'BufferRange'
-            -> BuildSignal a
+            -> BuildSignal
 insertChunk op bs = InsertChunk op bs
 
 
 -- | Fill a 'BufferRange' using a 'BuildStep'.
 {-# INLINE fillWithBuildStep #-}
 fillWithBuildStep
-    :: BuildStep a
+    :: BuildStep
     -- ^ Build step to use for filling the 'BufferRange'.
-    -> (Ptr Word8 -> a -> IO b)
+    -> (Ptr Word8 -> IO b)
     -- ^ Handling the 'done' signal
-    -> (Ptr Word8 -> Int -> BuildStep a -> IO b)
+    -> (Ptr Word8 -> Int -> BuildStep -> IO b)
     -- ^ Handling the 'bufferFull' signal
-    -> (Ptr Word8 -> S.ByteString -> BuildStep a -> IO b)
+    -> (Ptr Word8 -> S.ByteString -> BuildStep -> IO b)
     -- ^ Handling the 'insertChunk' signal
     -> BufferRange
     -- ^ Buffer range to fill.
@@ -337,7 +315,7 @@ fillWithBuildStep
 fillWithBuildStep step fDone fFull fChunk !br = do
     signal <- step br
     case signal of
-        Done op x                      -> fDone op x
+        Done op                        -> fDone op
         BufferFull minSize op nextStep -> fFull op minSize nextStep
         InsertChunk op bs nextStep     -> fChunk op bs nextStep
 
@@ -350,12 +328,12 @@ fillWithBuildStep step fDone fFull fChunk !br = do
 -- They are 'Monoid's where
 --   'mempty' is the zero-length sequence and
 --   'mappend' is concatenation, which runs in /O(1)/.
-newtype Builder = Builder (forall r. BuildStep r -> BuildStep r)
+newtype Builder = Builder (BuildStep -> BuildStep)
 
 -- | Construct a 'Builder'. In contrast to 'BuildStep's, 'Builder's are
 -- referentially transparent.
 {-# INLINE builder #-}
-builder :: (forall r. BuildStep r -> BuildStep r)
+builder :: (BuildStep -> BuildStep)
         -- ^ A function that fills a 'BufferRange', calls the continuation with
         -- the updated 'BufferRange' once its done, and signals its caller how
         -- to proceed using 'done', 'bufferFull', or 'insertChunk'.
@@ -373,21 +351,21 @@ builder :: (forall r. BuildStep r -> BuildStep r)
 builder = Builder
 
 -- | The final build step that returns the 'done' signal.
-finalBuildStep :: BuildStep ()
-finalBuildStep !(BufferRange op _) = return $ Done op ()
+finalBuildStep :: BuildStep
+finalBuildStep !(BufferRange op _) = return $ Done op
 
 -- | Run a 'Builder' with the 'finalBuildStep'.
 {-# INLINE runBuilder #-}
 runBuilder :: Builder      -- ^ 'Builder' to run
-           -> BuildStep () -- ^ 'BuildStep' that writes the byte stream of this
+           -> BuildStep    -- ^ 'BuildStep' that writes the byte stream of this
                            -- 'Builder' and signals 'done' upon completion.
 runBuilder b = runBuilderWith b finalBuildStep
 
 -- | Run a 'Builder'.
 {-# INLINE runBuilderWith #-}
 runBuilderWith :: Builder      -- ^ 'Builder' to run
-               -> BuildStep a -- ^ Continuation 'BuildStep'
-               -> BuildStep a
+               -> BuildStep   -- ^ Continuation 'BuildStep'
+               -> BuildStep
 runBuilderWith (Builder b) = b
 
 -- | The 'Builder' denoting a zero-length sequence of bytes. This function is
@@ -453,13 +431,13 @@ flush = builder step
 -- and 'fromPut' convert between these two types. Where possible, you should
 -- use 'Builder's, as sequencing them is slightly cheaper than sequencing
 -- 'Put's because they do not carry around a computed value.
-newtype Put a = Put { unPut :: forall r. (a -> BuildStep r) -> BuildStep r }
+newtype Put a = Put { unPut :: (a -> BuildStep) -> BuildStep }
 
 -- | Construct a 'Put' action. In contrast to 'BuildStep's, 'Put's are
 -- referentially transparent in the sense that sequencing the same 'Put'
 -- multiple times yields every time the same value with the same side-effect.
 {-# INLINE put #-}
-put :: (forall r. (a -> BuildStep r) -> BuildStep r)
+put :: ((a -> BuildStep) -> BuildStep)
        -- ^ A function that fills a 'BufferRange', calls the continuation with
        -- the updated 'BufferRange' and its computed value once its done, and
        -- signals its caller how to proceed using 'done', 'bufferFull', or
@@ -481,10 +459,10 @@ put = Put
 -- | Run a 'Put'.
 {-# INLINE runPut #-}
 runPut :: Put a       -- ^ Put to run
-       -> BuildStep a -- ^ 'BuildStep' that first writes the byte stream of
+       -> BuildStep   -- ^ 'BuildStep' that first writes the byte stream of
                       -- this 'Put' and then yields the computed value using
                       -- the 'done' signal.
-runPut (Put p) = p $ \x (BufferRange op _) -> return $ Done op x
+runPut (Put p) = p $ \x (BufferRange op _) -> return $ Done op
 
 instance Functor Put where
   fmap f p = Put $ \k -> unPut p (\x -> k (f x))
@@ -611,12 +589,12 @@ putLiftIO io = put $ \k br -> io >>= (`k` br)
 -- The output is buffered using the 'Handle's associated buffer. If this
 -- buffer is too small to execute one step of the 'Put' action, then
 -- it is replaced with a large enough buffer.
-hPut :: forall a. Handle -> Put a -> IO a
+hPut :: Handle -> Put a -> IO ()
 #if __GLASGOW_HASKELL__ >= 611
 hPut h p = do
     fillHandle 1 (runPut p)
   where
-    fillHandle :: Int -> BuildStep a -> IO a
+    fillHandle :: Int -> BuildStep -> IO ()
     fillHandle !minFree step = do
         next <- wantWritableHandle "hPut" h fillHandle_
         next
@@ -643,7 +621,7 @@ hPut h p = do
         --      'wantWritableHandle'. Therefore, we cannot call 'S.hPut'
         --      inside 'wantWritableHandle'.
         --
-        fillHandle_ :: Handle__ -> IO (IO a)
+        fillHandle_ :: Handle__ -> IO (IO ())
         fillHandle_ h_ = do
             makeSpace  =<< readIORef refBuf
             fillBuffer =<< readIORef refBuf
@@ -690,7 +668,7 @@ hPut h p = do
                         !buf' = buf {IO.bufR = off'}
                     writeIORef refBuf buf'
 
-                doneH op' x = do
+                doneH op' = do
                     updateBufR op'
                     -- We must flush if this Handle is set to NoBuffering.
                     -- If it is set to LineBuffering, be conservative and
@@ -698,8 +676,8 @@ hPut h p = do
                     -- Flushing must happen outside this 'wantWriteableHandle'
                     -- due to the possible async. exception.
                     case haBufferMode h_ of
-                        BlockBuffering _      -> return $ return x
-                        _line_or_no_buffering -> return $ hFlush h >> return x
+                        BlockBuffering _      -> return $ return ()
+                        _line_or_no_buffering -> return $ hFlush h >> return ()
 
                 fullH op' minSize nextStep = do
                     updateBufR op'
@@ -723,83 +701,6 @@ hPut h p =
     go (Yield1 bs io)   = S.hPut h bs >> io >>= go
 #endif
 
--- | Execute a 'Put' and return the computed result and the bytes
--- written during the computation as a lazy 'L.ByteString'.
---
--- This function is strict in the computed result and lazy in the writing of
--- the bytes. For example, given
---
--- @
---infinitePut = sequence_ (repeat (putBuilder (word8 1))) >> return 0
--- @
---
--- evaluating the expression
---
--- @
---fst $ putToLazyByteString infinitePut
--- @
---
--- does not terminate, while evaluating the expression
---
--- @
---L.head $ snd $ putToLazyByteString infinitePut
--- @
---
--- does terminate and yields the value @1 :: Word8@.
---
--- An illustrative example for these strictness properties is the
--- implementation of Base64 decoding (<http://en.wikipedia.org/wiki/Base64>).
---
--- @
---type DecodingState = ...
---
---decodeBase64 :: 'S.ByteString' -> DecodingState -> 'Put' (Maybe DecodingState)
---decodeBase64 = ...
--- @
---
--- The above function takes a strict 'S.ByteString' supposed to represent
--- Base64 encoded data and the current decoding state.
--- It writes the decoded bytes as the side-effect of the 'Put' and returns the
--- new decoding state, if the decoding of all data in the 'S.ByteString' was
--- successful. The checking if the strict 'S.ByteString' represents Base64
--- encoded data and the actual decoding are fused. This makes the common case,
--- where all data represents Base64 encoded data, more efficient. It also
--- implies that all data must be decoded before the final decoding
--- state can be returned. 'Put's are intended for implementing such fused
--- checking and decoding/encoding, which is reflected in their strictness
--- properties.
-{-# NOINLINE putToLazyByteString #-}
-putToLazyByteString
-    :: Put a              -- ^ 'Put' to execute
-    -> (a, L.ByteString)  -- ^ Result and lazy 'L.ByteString'
-                          -- written as its side-effect
-putToLazyByteString = putToLazyByteStringWith
-    (safeStrategy L.smallChunkSize L.defaultChunkSize) (\x -> (x, L.Empty))
-
-
--- | Execute a 'Put' with a buffer-allocation strategy and a continuation. For
--- example, 'putToLazyByteString' is implemented as follows.
---
--- @
---putToLazyByteString = 'putToLazyByteStringWith'
---    ('safeStrategy' 'L.smallChunkSize' 'L.defaultChunkSize') (\x -> (x, L.empty))
--- @
---
-{-# INLINE putToLazyByteStringWith #-}
-putToLazyByteStringWith
-    :: AllocationStrategy
-       -- ^ Buffer allocation strategy to use
-    -> (a -> (b, L.ByteString))
-       -- ^ Continuation to use for computing the final result and the tail of
-       -- its side-effect (the written bytes).
-    -> Put a
-       -- ^ 'Put' to execute
-    -> (b, L.ByteString)
-       -- ^ Resulting lazy 'L.ByteString'
-putToLazyByteStringWith strategy k p =
-    ciosToLazyByteString strategy k $ unsafeDupablePerformIO $
-        buildStepToCIOS strategy (runPut p)
-
 
 
 ------------------------------------------------------------------------------
@@ -821,7 +722,7 @@ ensureFree minFree =
 
 -- | Copy the bytes from a 'BufferRange' into the output stream.
 wrappedBytesCopyStep :: BufferRange  -- ^ Input 'BufferRange'.
-                     -> BuildStep a -> BuildStep a
+                     -> BuildStep -> BuildStep
 wrappedBytesCopyStep !(BufferRange ip0 ipe) k =
     go ip0
   where
@@ -872,7 +773,7 @@ byteStringCopy :: S.ByteString -> Builder
 byteStringCopy = \bs -> builder $ byteStringCopyStep bs
 
 {-# INLINE byteStringCopyStep #-}
-byteStringCopyStep :: S.ByteString -> BuildStep a -> BuildStep a
+byteStringCopyStep :: S.ByteString -> BuildStep -> BuildStep
 byteStringCopyStep (S.PS ifp ioff isize) !k0 br0@(BufferRange op ope)
     -- Ensure that the common case is not recursive and therefore yields
     -- better code.
@@ -912,7 +813,7 @@ shortByteString = \sbs -> builder $ shortByteStringCopyStep sbs
 -- | Copy the bytes from a 'SH.ShortByteString' into the output stream.
 {-# INLINE shortByteStringCopyStep #-}
 shortByteStringCopyStep :: Sh.ShortByteString  -- ^ Input 'SH.ShortByteString'.
-                        -> BuildStep a -> BuildStep a
+                        -> BuildStep -> BuildStep
 shortByteStringCopyStep !sbs k =
     go 0 (Sh.length sbs)
   where
@@ -1109,8 +1010,8 @@ toLazyByteStringWith strategy k b =
 {-# INLINE buildStepToCIOS #-}
 buildStepToCIOS
     :: AllocationStrategy          -- ^ Buffer allocation strategy to use
-    -> BuildStep a                 -- ^ 'BuildStep' to execute
-    -> IO (ChunkIOStream a)
+    -> BuildStep                   -- ^ 'BuildStep' to execute
+    -> IO ChunkIOStream
 buildStepToCIOS !(AllocationStrategy nextBuffer bufSize trim) =
     \step -> nextBuffer Nothing >>= fill step
   where
@@ -1121,8 +1022,8 @@ buildStepToCIOS !(AllocationStrategy nextBuffer bufSize trim) =
       where
         pbuf = unsafeForeignPtrToPtr fpbuf
 
-        doneH op' x = return $
-            Finished (Buffer fpbuf (BufferRange op' pe)) x
+        doneH op' = return $
+            Finished (Buffer fpbuf (BufferRange op' pe))
 
         fullH op' minSize nextStep =
             wrapChunk op' $ const $
